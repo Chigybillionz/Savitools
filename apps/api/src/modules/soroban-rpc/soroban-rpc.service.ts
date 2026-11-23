@@ -1,13 +1,12 @@
 import {
   BadGatewayException,
+  BadRequestException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import {
-  resolveStellarRpcUrl,
-  type StellarEndpointEnv,
-} from '../../config/stellar-endpoints';
+import { assertPublicHostname, MAX_SAFE_REDIRECTS } from '../../common/ssrf-guard';
+import { resolveStellarRpcUrl, type StellarEndpointEnv } from '../../config/stellar-endpoints';
 import {
   findRpcMethod,
   listRpcMethods,
@@ -80,9 +79,7 @@ export class SorobanRpcService {
   private rpcEnv(): StellarEndpointEnv {
     return {
       STELLAR_RPC_URL: this.config.get<string | undefined>('STELLAR_RPC_URL'),
-      STELLAR_RPC_PUBLIC_URL: this.config.get<string | undefined>(
-        'STELLAR_RPC_PUBLIC_URL',
-      ),
+      STELLAR_RPC_PUBLIC_URL: this.config.get<string | undefined>('STELLAR_RPC_PUBLIC_URL'),
     };
   }
 
@@ -120,10 +117,7 @@ export class SorobanRpcService {
   }
 
   private rpcUrl(network: SorobanRpcNetwork): string {
-    const url = resolveStellarRpcUrl(
-      this.rpcEnv(),
-      network === 'mainnet' ? 'public' : 'testnet',
-    );
+    const url = resolveStellarRpcUrl(this.rpcEnv(), network === 'mainnet' ? 'public' : 'testnet');
     this.assertEndpointAllowed(url);
     return url;
   }
@@ -140,44 +134,87 @@ export class SorobanRpcService {
     method: string;
     params?: Record<string, unknown>;
     network?: SorobanRpcNetwork;
+    rpcUrl?: string;
   }): Promise<ExecuteSorobanRpcResult> {
     const spec = this.getMethod(input.method);
     const params = validateRpcParams(spec, input.params);
     const network: SorobanRpcNetwork = input.network ?? 'testnet';
-    const url = this.rpcUrl(network);
+    const rawUrl = input.rpcUrl ?? this.rpcUrl(network);
+
+    let currentUrl: URL;
+    try {
+      currentUrl = new URL(rawUrl);
+    } catch {
+      throw new BadRequestException(`Invalid RPC URL: ${rawUrl}`);
+    }
+    if (currentUrl.protocol !== 'http:' && currentUrl.protocol !== 'https:') {
+      throw new BadRequestException(
+        `Unsupported URL protocol "${currentUrl.protocol}". Only http and https are allowed.`,
+      );
+    }
+    await assertPublicHostname(currentUrl.hostname);
+    this.assertEndpointAllowed(currentUrl.toString());
+
     const id = ++this.requestCounter;
+    const bodyStr = JSON.stringify({
+      jsonrpc: '2.0',
+      id,
+      method: spec.name,
+      params,
+    });
 
     const startedAt = Date.now();
     let response: Response;
     try {
-      response = await fetch(url, {
+      let currentUrlStr = rawUrl;
+      response = await fetch(currentUrlStr, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id,
-          method: spec.name,
-          params,
-        }),
+        body: bodyStr,
         signal: AbortSignal.timeout(RPC_TIMEOUT_MS),
+        redirect: 'manual',
       });
+
+      let hops = 0;
+      while (
+        [301, 302, 303, 307, 308].includes(response.status) &&
+        response.headers.has('location')
+      ) {
+        if (++hops > MAX_SAFE_REDIRECTS) {
+          throw new BadGatewayException('Too many redirects from Soroban RPC endpoint');
+        }
+        const location = response.headers.get('location')!;
+        currentUrl = new URL(location, currentUrl);
+        currentUrlStr = currentUrl.toString();
+        if (currentUrl.protocol !== 'http:' && currentUrl.protocol !== 'https:') {
+          throw new BadRequestException(`Unsupported protocol in redirect: ${currentUrl.protocol}`);
+        }
+        await assertPublicHostname(currentUrl.hostname);
+        this.assertEndpointAllowed(currentUrlStr);
+
+        const nextMethod = response.status === 303 ? 'GET' : 'POST';
+        response = await fetch(currentUrlStr, {
+          method: nextMethod,
+          headers: nextMethod === 'GET' ? undefined : { 'Content-Type': 'application/json' },
+          body: nextMethod === 'GET' ? undefined : bodyStr,
+          signal: AbortSignal.timeout(RPC_TIMEOUT_MS),
+          redirect: 'manual',
+        });
+      }
     } catch (error: unknown) {
+      if (error instanceof BadRequestException || error instanceof BadGatewayException) {
+        throw error;
+      }
       const reason = error instanceof Error ? error.message : String(error);
-      throw new BadGatewayException(
-        `Could not reach the Soroban RPC endpoint: ${reason}`,
-      );
+      throw new BadGatewayException(`Could not reach the Soroban RPC endpoint: ${reason}`);
     }
     const tookMs = Date.now() - startedAt;
 
     if (!response.ok) {
-      throw new BadGatewayException(
-        `Soroban RPC responded with HTTP ${response.status}`,
-      );
+      throw new BadGatewayException(`Soroban RPC responded with HTTP ${response.status}`);
     }
 
-    const payload = (await response.json().catch(() => null)) as
-      | JsonRpcPayload
-      | null;
+    const payload = (await response.json().catch(() => null)) as JsonRpcPayload | null;
     if (!payload || typeof payload !== 'object') {
       throw new BadGatewayException('Soroban RPC returned a non-JSON response');
     }
@@ -190,9 +227,7 @@ export class SorobanRpcService {
         error: {
           code: payload.error.code ?? -1,
           message: payload.error.message ?? 'Unknown JSON-RPC error',
-          ...(payload.error.data === undefined
-            ? {}
-            : { data: payload.error.data }),
+          ...(payload.error.data === undefined ? {} : { data: payload.error.data }),
         },
       };
     }
