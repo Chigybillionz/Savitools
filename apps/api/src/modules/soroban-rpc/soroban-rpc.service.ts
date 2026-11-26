@@ -1,11 +1,5 @@
-import {
-  BadGatewayException,
-  BadRequestException,
-  Injectable,
-  NotFoundException,
-} from '@nestjs/common';
+import { BadGatewayException, Injectable, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { assertPublicHostname, MAX_SAFE_REDIRECTS } from '../../common/ssrf-guard';
 import { resolveStellarRpcUrl, type StellarEndpointEnv } from '../../config/stellar-endpoints';
 import {
   findRpcMethod,
